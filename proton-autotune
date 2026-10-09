@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""proton-autotune: set Steam launch options for every game in your library to the ones
+that recent ProtonDB reports from NVIDIA users with a working game mention most often.
+
+- Data: github.com/bdefore/protondb-data (monthly dump), refreshed weekly and reduced to a small index.
+- Writes localconfig.vdf only after Steam has exited (Steam overwrites it on exit), with a backup.
+- Never touches launch options it did not write itself (tracked in state.json).
+
+Usage: proton-autotune [--dry-run]
+"""
+import glob, json, os, re, shlex, shutil, socket, subprocess, sys, tarfile, time, urllib.request
+from collections import Counter
+
+socket.setdefaulttimeout(60)
+HOME = os.path.expanduser("~")
+DIR = os.path.join(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"), "proton-autotune")
+INDEX, TITLES = f"{DIR}/index.json", f"{DIR}/titles.json"
+STATE, LOG = f"{DIR}/state.json", f"{DIR}/log.txt"
+STEAM_DIRS = [f"{HOME}/.local/share/Steam", f"{HOME}/.steam/steam",
+              f"{HOME}/.var/app/com.valvesoftware.Steam/.local/share/Steam"]
+STEAM = next((d for d in STEAM_DIRS if os.path.isdir(f"{d}/steamapps")), STEAM_DIRS[0])
+
+MIN_REPORTS = 3        # an option must be mentioned by at least this many reports
+MIN_SHARE = 0.30       # ...and by at least 30 % of the game's reports
+MAX_AGE_DAYS = 730     # ignore reports older than two years
+GPU_VENDOR = os.environ.get("PROTON_AUTOTUNE_GPU", "NVIDIA")
+# Debug/overlay options and things usually set globally are never copied
+SKIP = re.compile(r"^(PROTON_LOG|DXVK_HUD|MANGOHUD|DXVK_ASYNC|PROTON_DXVK_LOWLATENCY|PROTON_VKD3D_LOWLATENCY|"
+                  r"gamemoderun|mangohud|game-performance|LD_PRELOAD|__GL_SHADER)", re.I)
+ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.+$")
+SHELL_OP = re.compile(r"\s(?:;|&&|\|\||\||&)(?:\s|$)")  # anything after this is another command
+
+
+def log(msg):
+    line = f"{time.strftime('%F %T')} {msg}"
+    print(line)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def write_json(path, obj, **kw):
+    """Write atomically, so a crash never leaves a half-written file behind."""
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(obj, f, **kw)
+    os.replace(path + ".tmp", path)
+
+
+def build_index(tgz, label):
+    with tarfile.open(tgz) as t:
+        member = next(m for m in t.getmembers() if m.name.endswith(".json"))
+        reports = json.load(t.extractfile(member))
+    cutoff = time.time() - MAX_AGE_DAYS * 86400
+    idx, titles = {}, {}
+    for r in reports:
+        app = r.get("app", {})
+        appid = str(app.get("steam", {}).get("appId", ""))
+        if appid and app.get("title"):
+            titles[appid] = app["title"]
+        resp, si = r.get("responses", {}), r.get("systemInfo", {})
+        if r.get("timestamp", 0) < cutoff or resp.get("verdict") != "yes" or GPU_VENDOR not in str(si.get("gpu", "")):
+            continue
+        if appid:
+            idx.setdefault(appid, []).append(resp.get("launchOptions", "") or "")
+    write_json(INDEX, idx)
+    write_json(TITLES, titles)
+    os.remove(tgz)
+    log(f"index rebuilt from {label}: {len(idx)} games")
+
+
+def refresh_index():
+    tgz = f"{DIR}/reports.tar.gz"
+    if os.path.exists(TITLES) and time.time() - os.path.getmtime(INDEX) < 7 * 86400:
+        return
+    api = "https://api.github.com/repos/bdefore/protondb-data/contents/reports"
+    files = [f["name"] for f in json.load(urllib.request.urlopen(api)) if f["name"].endswith(".tar.gz")]
+    mon = dict(jan=1, feb=2, mar=3, apr=4, may=5, jun=6, jul=7, aug=8, sep=9, oct=10, nov=11, dec=12)
+
+    def key(n):
+        m = re.match(r"reports_([a-z]+)(\d+)_(\d+)", n)
+        return int(m[3]), mon[m[1]], int(m[2])
+
+    newest = max(files, key=key)
+    urllib.request.urlretrieve(f"https://raw.githubusercontent.com/bdefore/protondb-data/master/reports/{newest}", tgz)
+    build_index(tgz, newest)
+
+
+def split(text):
+    """Shell-style split so quoted values with spaces stay one token; broken quoting falls back to whitespace."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def game_flags(tokens):
+    """Standalone flags only: a flag followed by a value (-w 1920) is skipped, because copying it
+    without its value would break the game."""
+    return {t for i, t in enumerate(tokens)
+            if t.startswith("-") and (i + 1 == len(tokens) or tokens[i + 1].startswith(("-", "+")))}
+
+
+def suggest(opts):
+    """Most common env vars and game arguments across the reports, or None."""
+    n = len(opts)
+    if n < MIN_REPORTS:
+        return None
+    env, args = Counter(), Counter()
+    for o in opts:
+        pre, has_cmd, post = o.partition("%command%")
+        if not has_cmd:  # Steam appends options without %command% to the game's arguments
+            pre, post = "", pre
+        post = SHELL_OP.split(" " + post)[0]
+        for t in set(split(pre)):
+            if ENV.match(t) and not SKIP.match(t):
+                env[t] += 1
+        for t in game_flags(split(post)):
+            if not SKIP.match(t):
+                args[t] += 1
+
+    def popular(c):
+        return c >= MIN_REPORTS and c / n >= MIN_SHARE
+
+    best = {}
+    for t, c in env.items():  # one value per variable: the most common one
+        k = t.split("=", 1)[0]
+        if popular(c) and c > best.get(k, ("", 0))[1]:
+            best[k] = (t, c)
+    pre = [k + "=" + shlex.quote(v) for k, v in (t.split("=", 1) for t, _ in sorted(best.values()))]
+    post = sorted(shlex.quote(t) for t, c in args.items() if popular(c))
+    return " ".join(pre + ["%command%"] + post) if pre or post else None
+
+
+def installed_games():
+    games = {}
+    vdf_txt = open(f"{STEAM}/steamapps/libraryfolders.vdf", encoding="utf-8").read()
+    libs = {STEAM} | set(re.findall(r'"path"\s+"([^"]+)"', vdf_txt))
+    for lib in libs:
+        for acf in glob.glob(f"{lib}/steamapps/appmanifest_*.acf"):
+            txt = open(acf, encoding="utf-8", errors="ignore").read()
+            app, name = re.search(r'"appid"\s+"(\d+)"', txt), re.search(r'"name"\s+"([^"]+)"', txt)
+            if app:
+                games[app[1]] = name[1] if name else app[1]
+    return games
+
+
+def library_games():
+    """Every library entry, installed or not: Steam keeps an artwork cache folder for each one."""
+    titles = json.load(open(TITLES, encoding="utf-8")) if os.path.exists(TITLES) else {}
+    cache = f"{STEAM}/appcache/librarycache"
+    games = {a: titles.get(a, a) for a in os.listdir(cache) if a.isdigit()} if os.path.isdir(cache) else {}
+    games.update(installed_games())
+    return games
+
+
+def steam_running():
+    return subprocess.run(["pgrep", "-x", "-u", str(os.getuid()), "steam"], capture_output=True).returncode == 0
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    os.makedirs(DIR, exist_ok=True)
+    try:
+        refresh_index()
+    except Exception as e:  # offline or rate-limited: keep using the last index
+        log(f"index refresh failed: {e}")
+        if not os.path.exists(INDEX):
+            sys.exit(1)
+    if not dry:
+        # Steam rewrites localconfig.vdf from memory when it exits, so wait for that first.
+        while steam_running():
+            time.sleep(5)
+        time.sleep(3)
+    import vdf
+    idx = json.load(open(INDEX, encoding="utf-8"))
+    state = json.load(open(STATE, encoding="utf-8")) if os.path.exists(STATE) else {}
+    prev = dict(state)  # what this tool wrote before this run, the same for every Steam user
+    games = library_games()
+    changed = []
+    for cfg in glob.glob(f"{STEAM}/userdata/*/config/localconfig.vdf"):
+        data = vdf.load(open(cfg, encoding="utf-8"))
+        apps = data["UserLocalConfigStore"]["Software"]["Valve"]["Steam"].setdefault("apps", {})
+        mine = []
+        for app, name in games.items():
+            cur = apps.get(app, {}).get("LaunchOptions", "")
+            if cur and cur != prev.get(app):  # set by the user: leave it alone
+                continue
+            new = suggest(idx.get(app, [])) or ""
+            if new == cur:
+                continue
+            mine.append((app, name, cur, new))
+            if not dry:
+                apps.setdefault(app, {})["LaunchOptions"] = new
+                if new:
+                    state[app] = new
+                else:
+                    state.pop(app, None)
+        if mine and not dry:
+            if steam_running():  # Steam came back while we were working: try again next run
+                log("Steam started during the run, nothing written")
+                return
+            shutil.copy2(cfg, cfg + f".bak-autotune-{time.strftime('%Y%m%d-%H%M%S')}")
+            with open(cfg + ".tmp", "w", encoding="utf-8") as f:
+                vdf.dump(data, f, pretty=True)
+            os.replace(cfg + ".tmp", cfg)
+        changed += mine
+    for app, name, cur, new in changed:
+        log(f"{'[dry-run] ' if dry else ''}{name} ({app}): '{cur}' -> '{new}'")
+    if not dry:
+        write_json(STATE, state, indent=1)
+        if changed and shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-i", "steam", "proton-autotune",
+                            f"Updated {len(changed)} game(s), see {LOG}"], capture_output=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run proton-autotune when a new game appears in the Steam library
+
+[Path]
+# Steam creates a folder here for every new library entry (bought or installed)
+PathChanged=%h/.local/share/Steam/appcache/librarycache
+Unit=proton-autotune.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run proton-autotune weekly (missed runs are caught up)
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

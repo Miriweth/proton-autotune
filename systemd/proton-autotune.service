@@ -1,0 +1,8 @@
+[Unit]
+Description=Apply ProtonDB launch options to Steam games (writes once Steam exits)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+Nice=15
+ExecStart=%h/.local/bin/proton-autotune
