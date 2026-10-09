@@ -8,7 +8,7 @@ that recent ProtonDB reports from NVIDIA users with a working game mention most 
 
 Usage: proton-autotune [--dry-run]
 """
-import glob, json, os, re, shlex, shutil, socket, subprocess, sys, tarfile, time, urllib.request
+import glob, io, json, os, re, shlex, shutil, socket, subprocess, sys, tarfile, time, urllib.request
 from collections import Counter
 
 socket.setdefaulttimeout(60)
@@ -45,13 +45,51 @@ def write_json(path, obj, **kw):
     os.replace(path + ".tmp", path)
 
 
+def iter_reports(fh, chunk=1 << 20):
+    """Yield the objects of a top-level JSON array one at a time, so the ~530 MB dump never
+    has to fit in memory. Only a chunk plus the current object is held."""
+    dec, buf, pos, eof = json.JSONDecoder(), "", 0, False
+    while True:
+        while pos < len(buf) and buf[pos] in " \t\r\n,[":
+            pos += 1
+        if pos == len(buf):
+            if eof:
+                return
+            data = fh.read(chunk)
+            eof = not data
+            buf, pos = buf[pos:] + data, 0
+            continue
+        if buf[pos] == "]":
+            return
+        try:
+            obj, end = dec.raw_decode(buf, pos)
+        except json.JSONDecodeError:
+            if eof:
+                raise
+            data = fh.read(chunk)  # object cut off at the chunk boundary: read more and retry
+            eof = not data
+            buf, pos = buf[pos:] + data, 0
+            continue
+        pos = end
+        yield obj
+
+
 def build_index(tgz, label):
-    with tarfile.open(tgz) as t:
-        member = next(m for m in t.getmembers() if m.name.endswith(".json"))
-        reports = json.load(t.extractfile(member))
     cutoff = time.time() - MAX_AGE_DAYS * 86400
     idx, titles = {}, {}
+    with tarfile.open(tgz) as t:
+        member = next(m for m in t.getmembers() if m.name.endswith(".json"))
+        reports = fill_index(iter_reports(io.TextIOWrapper(t.extractfile(member), encoding="utf-8")), cutoff, idx, titles)
+    write_json(INDEX, idx)
+    write_json(TITLES, titles)
+    os.remove(tgz)
+    log(f"index rebuilt from {label}: {len(idx)} games from {reports} reports")
+
+
+def fill_index(reports, cutoff, idx, titles):
+    n = 0
     for r in reports:
+        n += 1
         app = r.get("app", {})
         appid = str(app.get("steam", {}).get("appId", ""))
         if appid and app.get("title"):
@@ -61,10 +99,7 @@ def build_index(tgz, label):
             continue
         if appid:
             idx.setdefault(appid, []).append(resp.get("launchOptions", "") or "")
-    write_json(INDEX, idx)
-    write_json(TITLES, titles)
-    os.remove(tgz)
-    log(f"index rebuilt from {label}: {len(idx)} games")
+    return n
 
 
 def refresh_index():

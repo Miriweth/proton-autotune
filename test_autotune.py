@@ -22,3 +22,11 @@ assert s(["gamescope -f -- %command%"] * 3) is None, "wrapper flags before %comm
 assert s(["-dx11 -novid"] * 3) == "%command% -dx11 -novid", "options without %command% count as game args"
 assert s(["mesa_glthread=true %command%"] * 3) == "mesa_glthread=true %command%", "lowercase env vars work"
 print("ok")
+
+import io
+reports = [{"a": i, "s": "x" * (i * 7)} for i in range(50)]
+for chunk in (1, 7, 64, 1 << 20):  # objects cut at every possible chunk boundary
+    got = list(pa.iter_reports(io.StringIO(" [ " + " , ".join(__import__("json").dumps(r) for r in reports) + " ] "), chunk))
+    assert got == reports, f"streaming parse broke at chunk size {chunk}"
+assert list(pa.iter_reports(io.StringIO("[]"))) == [], "empty array"
+print("ok (streaming)")

@@ -41,8 +41,8 @@ timer (missed runs are caught up after boot) and a path watcher that runs the to
 your library changes, so new games are picked up. Native, `~/.steam/steam` and Flatpak Steam
 are detected.
 
-Rebuilding the index loads the whole ProtonDB dump and needs a few GB of RAM for about a
-minute, once a week.
+The weekly index rebuild streams the ~530 MB ProtonDB dump report by report, so it stays
+under 100 MB of RAM and takes a few seconds.
 
 To see what it would change without writing anything (`~/.local/bin` has to be on your
 `PATH`, otherwise call it with the full path):
